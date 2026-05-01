@@ -20,6 +20,8 @@ def fit_linear_encoding_models(
     days_to_include: list = None,
     session_type: str = None,
     target_fps: float = None,
+    n_splines: int = 10,
+    spline_degree: int = 3,
     offset: bool = False,
     n_folds: int = 3,
     verbose: bool = True
@@ -445,6 +447,63 @@ def fit_linear_encoding_models(
             raise ValueError(f"Design matrix has {X.shape[0]} timepoints but expected {signal_length}")
         return X
 
+    # ── Spline-basis helpers (all capture n_splines / spline_degree via closure) ──
+
+    def _make_spline_basis(total_frames: int) -> np.ndarray:
+        """
+        Build a B-spline basis matrix of shape (total_frames, ns) where
+        ns = min(n_splines, total_frames).  Each column is one basis function
+        evaluated at total_frames evenly-spaced points in [0, 1].
+        """
+        ns = min(n_splines, total_frames)
+        ns = max(ns, spline_degree + 1)   # need at least degree+1 basis functions
+        x  = np.linspace(0.0, 1.0, total_frames)
+
+        n_interior = ns - spline_degree - 1
+        interior   = (np.linspace(0.0, 1.0, n_interior + 2)[1:-1]
+                      if n_interior > 0 else np.array([]))
+        knots = np.concatenate([
+            np.zeros(spline_degree + 1),
+            interior,
+            np.ones(spline_degree + 1),
+        ])
+
+        B = np.zeros((total_frames, ns))
+        for i in range(ns):
+            c = np.zeros(ns)
+            c[i] = 1.0
+            B[:, i] = interpolate.BSpline(knots, c, spline_degree)(x)
+        return B
+
+    def _project_spline(X_lag: np.ndarray, B: np.ndarray,
+                        n_feat: int, total_kf: int, inc_offset: bool) -> np.ndarray:
+        """Project an (n_time, n_feat * total_kf * n_evt) lag matrix into
+        the spline basis, returning (n_time, n_feat * ns * n_evt)."""
+        ns    = B.shape[1]
+        n_evt = 2 if inc_offset else 1
+        X_spl = np.zeros((X_lag.shape[0], n_feat * ns * n_evt))
+        for f in range(n_feat):
+            for e in range(n_evt):
+                lag_s = f * total_kf * n_evt + e * total_kf
+                spl_s = f * ns * n_evt + e * ns
+                X_spl[:, spl_s:spl_s + ns] = X_lag[:, lag_s:lag_s + total_kf] @ B
+        return X_spl
+
+    def _kernels_from_spline_coef(coef: np.ndarray, B: np.ndarray,
+                                   n_feat: int, total_kf: int,
+                                   inc_offset: bool) -> np.ndarray:
+        """Reconstruct smooth per-feature kernels from spline coefficients.
+        Returns array of shape (n_feat, total_kf * n_evt)."""
+        ns    = B.shape[1]
+        n_evt = 2 if inc_offset else 1
+        out   = np.zeros((n_feat, total_kf * n_evt))
+        for f in range(n_feat):
+            for e in range(n_evt):
+                spl_s = f * ns * n_evt + e * ns
+                k_s   = e * total_kf
+                out[f, k_s:k_s + total_kf] = B @ coef[spl_s:spl_s + ns]
+        return out
+
     def _extract_signal_array(row, signal_name):
         """
         Safely extract a numpy array from a photometry DataFrame row.
@@ -768,12 +827,17 @@ def fit_linear_encoding_models(
                     len(test_signal) < total_kernel_frames):
                 continue
 
-            X_train = create_design_matrix(train_behavioral, len(train_signal), effective_fps,
-                                        kernel_length_frames, pre_onset_frames,
-                                        include_offset=offset)
-            X_test = create_design_matrix(test_behavioral, len(test_signal), effective_fps,
-                                        kernel_length_frames, pre_onset_frames,
-                                        include_offset=offset)
+            B_cv   = _make_spline_basis(total_kernel_frames)
+            X_train = _project_spline(
+                create_design_matrix(train_behavioral, len(train_signal), effective_fps,
+                                     kernel_length_frames, pre_onset_frames,
+                                     include_offset=offset),
+                B_cv, len(behavioral_features), total_kernel_frames, offset)
+            X_test = _project_spline(
+                create_design_matrix(test_behavioral, len(test_signal), effective_fps,
+                                     kernel_length_frames, pre_onset_frames,
+                                     include_offset=offset),
+                B_cv, len(behavioral_features), total_kernel_frames, offset)
 
             # Mask out NaN regions
             train_valid = ~np.isnan(train_signal)
@@ -870,8 +934,11 @@ def fit_linear_encoding_models(
             chosen_alpha = signal_alphas.get(signal_name, alpha_list[0])
             cv_mse_arr = signal_cv_scores.get(signal_name, _nan_cv_scores)
 
-            X = create_design_matrix(all_behavioral_data, len(signal_data), effective_fps,
-                                    kernel_length_frames, pre_onset_frames, include_offset=offset)
+            B_fit = _make_spline_basis(total_kernel_frames)
+            X = _project_spline(
+                create_design_matrix(all_behavioral_data, len(signal_data), effective_fps,
+                                     kernel_length_frames, pre_onset_frames, include_offset=offset),
+                B_fit, len(behavioral_features), total_kernel_frames, offset)
 
             # Mask out NaN regions
             valid_indices = ~np.isnan(signal_data)
@@ -931,11 +998,14 @@ def fit_linear_encoding_models(
                     print(f"Model fitting failed for {mouse_id} {signal_name}: {fit_error}")
                 continue
 
-            coefficients = model.coef_
-            predictors_per_feature = total_kernel_frames * (2 if offset else 1)
-            kernels = coefficients.reshape(len(behavioral_features), predictors_per_feature)
+            coefficients    = model.coef_
             n_nonzero_coefs = np.sum(np.abs(coefficients) > 1e-8)
-            sparsity_ratio = 1 - (n_nonzero_coefs / len(coefficients)) if len(coefficients) > 0 else 0.0
+            sparsity_ratio  = (1 - (n_nonzero_coefs / len(coefficients))
+                               if len(coefficients) > 0 else 0.0)
+            # Reconstruct smooth kernels by multiplying spline coef by basis matrix
+            kernels = _kernels_from_spline_coef(
+                coefficients, B_fit,
+                len(behavioral_features), total_kernel_frames, offset)
 
             # Reconstruct the full concatenated signal (including NaN regions)
             reconstructed_concat = X @ coefficients + model.intercept_
@@ -1012,16 +1082,21 @@ def fit_linear_encoding_models(
                 per_session_reconstructions[session_id][signal_name] = reconstructed_at_original_fps
 
             recon_data[(mouse_id, signal_name)] = {
-                'design_matrix': X,
+                'design_matrix': X,           # spline design matrix (n_time × n_feat*ns*n_evt)
                 'original_signal': signal_data.copy(),
                 'valid_indices': valid_indices.copy(),
-                'coefficients': coefficients.copy(),
+                'coefficients': coefficients.copy(),   # spline coefficients
                 'intercept': model.intercept_,
                 'effective_fps': effective_fps,
                 'original_fps': original_fps,
                 'group_id': mouse_id,
                 'signal_name': signal_name,
                 'behavioral_features': list(behavioral_features),
+                'behavioral_signals': {                # concatenated binary signals per feature
+                    feat: all_behavioral_data[feat].copy()
+                    for feat in behavioral_features
+                },
+                'spline_basis': B_fit.copy(),          # (total_kernel_frames, ns)
                 'kernel_length_frames': kernel_length_frames,
                 'pre_onset_frames': pre_onset_frames,
                 'total_kernel_frames': total_kernel_frames,
