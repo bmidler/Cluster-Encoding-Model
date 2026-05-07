@@ -36,9 +36,9 @@ python3 "${SCRIPT_DIR}/fit_encoding_worker.py" \
     --photometry_pkl  "${SCRIPT_DIR}/dff_data.pkl" \
     --annotations_pkl "${SCRIPT_DIR}/segmentation_data.pkl" \
     --output_dir      "${SCRIPT_DIR}/results" \
-    --kernel_length_sec 20 \
+    --kernel_length_sec 10 \
     --pre_onset_sec     5 \
-    --target_fps        4 \
+    --target_fps        8 \
     --regularization    ridge \
     --alpha_low         1 \
     --alpha_high        10 \
