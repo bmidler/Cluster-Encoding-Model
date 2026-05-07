@@ -728,14 +728,52 @@ def fit_linear_encoding_models(
         return all_behavioral_data, all_photometry_data, session_lengths
 
     # ---- Cross-validation logic ----
-    def create_stratified_folds(mouse_sessions_dict, n_folds_cv):
-        folds = [[] for _ in range(n_folds_cv)]
-        for mouse_id, sessions in mouse_sessions_dict.items():
-            shuffled = list(sessions)
-            np.random.shuffle(shuffled)
-            for i, sid in enumerate(shuffled):
-                folds[i % n_folds_cv].append(sid)
-        return folds
+    def slice_session_data(sd, start, end):
+        """Return a session data dict with all arrays sliced to [start:end]."""
+        return {
+            'session_id': sd['session_id'],
+            'original_fps': sd['original_fps'],
+            'effective_fps': sd['effective_fps'],
+            'min_length': end - start,
+            'behavioral_data': {feat: arr[start:end]
+                                for feat, arr in sd['behavioral_data'].items()},
+            'photometry_signals': {sig: arr[start:end]
+                                   for sig, arr in sd['photometry_signals'].items()},
+        }
+
+    def create_within_session_chunk_folds(sessions_data_list, n_folds_cv, min_chunk_frames=1):
+        """
+        Split each session into n_folds_cv equal-sized chunks and randomly assign chunks
+        to folds. The assignment is independently permuted per session so that different
+        sessions contribute held-out chunks from different within-session positions for
+        each fold (avoiding the pathological case where every session always holds out
+        its first chunk in fold 0, etc.).
+
+        Sessions too short to yield chunks of at least min_chunk_frames are skipped.
+
+        Returns
+        -------
+        fold_chunks : list of n_folds_cv lists
+            fold_chunks[k] contains (sd, chunk_start, chunk_end) for the test chunk
+            contributed by each session in fold k.
+        """
+        fold_chunks = [[] for _ in range(n_folds_cv)]
+        for sd in sessions_data_list:
+            session_length = sd['min_length']
+            chunk_size = session_length // n_folds_cv
+            if chunk_size < min_chunk_frames:
+                continue
+
+            # Independent random permutation: perm[chunk_pos] = fold_idx this chunk is held out in
+            perm = np.random.permutation(n_folds_cv)
+            for chunk_pos in range(n_folds_cv):
+                fold_k = perm[chunk_pos]
+                start = chunk_pos * chunk_size
+                # Last chunk absorbs any remaining frames
+                end = session_length if chunk_pos == n_folds_cv - 1 else start + chunk_size
+                fold_chunks[fold_k].append((sd, start, end))
+
+        return fold_chunks
 
     def cv_select_alpha_for_signal(sessions_data_dict, mouse_session_list, signal_name,
                                alpha_candidates, n_folds_cv, effective_fps,
@@ -743,6 +781,10 @@ def fit_linear_encoding_models(
         """
         Use cross-validation to select the best alpha for a specific (mouse, signal) combination.
         Uses MSE to select the best alpha. Handles NaN-masked data properly.
+
+        Each session is split into n_folds_cv chunks. For each fold, one chunk per session
+        is held out as the test set (with the held-out chunk position randomized
+        independently per session). The remaining chunks form the training set.
 
         Returns:
         --------
@@ -764,53 +806,54 @@ def fit_linear_encoding_models(
 
         default_scores = {a: np.inf for a in alpha_candidates}
 
-        if len(sids_with_signal_data) < 2:
+        if len(sids_with_signal_data) < 1:
             if verbose:
-                print(f"    CV [{signal_name}]: Not enough sessions with valid data "
-                      f"({len(sids_with_signal_data)}). Using first alpha: {alpha_candidates[0]}")
+                print(f"    CV [{signal_name}]: No sessions with valid data. "
+                      f"Using first alpha: {alpha_candidates[0]}")
             return alpha_candidates[0], default_scores
 
-        effective_n_folds = min(n_folds_cv, len(sids_with_signal_data))
-        if effective_n_folds < 2:
+        sessions_for_cv = [sessions_data_dict[sid] for sid in sids_with_signal_data]
+
+        # Each chunk must be long enough to build at least one valid design-matrix row
+        fold_chunks = create_within_session_chunk_folds(
+            sessions_for_cv, n_folds_cv, min_chunk_frames=total_kernel_frames
+        )
+
+        non_empty_fold_indices = [k for k in range(n_folds_cv) if len(fold_chunks[k]) > 0]
+
+        if len(non_empty_fold_indices) < 2:
             if verbose:
-                print(f"    CV [{signal_name}]: Cannot form ≥2 folds. "
-                    f"Using first alpha: {alpha_candidates[0]}")
+                print(f"    CV [{signal_name}]: Not enough data to form ≥2 folds with valid "
+                      f"chunks. Using first alpha: {alpha_candidates[0]}")
             return alpha_candidates[0], default_scores
 
-        if effective_n_folds < n_folds_cv and verbose:
-            print(f"    CV [{signal_name}]: Reducing folds from {n_folds_cv} "
-                f"to {effective_n_folds} (only {len(sids_with_signal_data)} sessions with valid data)")
-
-        single_mouse_dict = {"_mouse_": sids_with_signal_data}
-        folds = create_stratified_folds(single_mouse_dict, effective_n_folds)
-        folds = [f for f in folds if len(f) > 0]
-
-        if len(folds) < 2:
-            if verbose:
-                print(f"    CV [{signal_name}]: Not enough non-empty folds. "
-                    f"Using first alpha: {alpha_candidates[0]}")
-            return alpha_candidates[0], default_scores
+        if len(non_empty_fold_indices) < n_folds_cv and verbose:
+            print(f"    CV [{signal_name}]: Only {len(non_empty_fold_indices)} of {n_folds_cv} "
+                  f"folds have test chunks; proceeding with available folds.")
 
         alpha_scores = {a: [] for a in alpha_candidates}
 
-        for fold_idx in range(len(folds)):
-            test_session_ids = set(folds[fold_idx])
-            train_session_ids = [sid for j, fold in enumerate(folds)
-                                if j != fold_idx for sid in fold]
+        for fold_idx in non_empty_fold_indices:
+            # Test set: the held-out chunk from each session for this fold
+            test_virtual = [slice_session_data(sd, start, end)
+                            for sd, start, end in fold_chunks[fold_idx]]
 
-            train_sessions_data = [sessions_data_dict[sid] for sid in train_session_ids
-                                if sid in sessions_data_dict and sessions_data_dict[sid] is not None]
-            test_sessions_data = [sessions_data_dict[sid] for sid in test_session_ids
-                                if sid in sessions_data_dict and sessions_data_dict[sid] is not None]
+            # Train set: all chunks from all other folds, each treated as a sub-session
+            # (buffer frames are inserted between them by concatenate_sessions_data)
+            train_virtual = [
+                slice_session_data(sd, start, end)
+                for k in range(n_folds_cv) if k != fold_idx
+                for sd, start, end in fold_chunks[k]
+            ]
 
-            if not train_sessions_data or not test_sessions_data:
+            if not train_virtual or not test_virtual:
                 continue
 
             train_behavioral, train_photometry, _ = concatenate_sessions_data(
-                train_sessions_data, buffer_frames=total_kernel_frames
+                train_virtual, buffer_frames=total_kernel_frames
             )
             test_behavioral, test_photometry, _ = concatenate_sessions_data(
-                test_sessions_data, buffer_frames=total_kernel_frames
+                test_virtual, buffer_frames=total_kernel_frames
             )
 
             if signal_name not in train_photometry or signal_name not in test_photometry:
@@ -871,7 +914,8 @@ def fit_linear_encoding_models(
         best_alpha = min(mean_scores, key=mean_scores.get)
 
         if verbose:
-            print(f"    CV [{signal_name}] ({len(folds)} folds):")
+            print(f"    CV [{signal_name}] ({len(non_empty_fold_indices)} folds, "
+                  f"within-session chunks):")
             for a in alpha_candidates:
                 score_str = (f"{mean_scores[a]:.4f}"
                             if mean_scores[a] < np.inf else "N/A")
